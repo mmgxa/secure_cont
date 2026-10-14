@@ -43,6 +43,21 @@ kubectl apply -f tests/test-kata-pod.yaml      # QEMU
 kubectl apply -f tests/test-kata-fc-pod.yaml   # Firecracker
 ```
 
+
+
+## Verify
+
+To verify the isolation, you can look into the kernel variations in the host as well as in the deployed containers.
+
+![](./imgs/fc.png)
+
+![](./imgs/qemu.png)
+
+Run the following command to get the kernel of the host.
+
+```
+kubectl get node -o jsonpath='{.items[0].status.nodeInfo.kernelVersion}'
+```
 ## Teardown
 
 ```bash

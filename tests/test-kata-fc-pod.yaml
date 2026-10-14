@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: kata-fc-test1
+  name: kata-fc-test
 spec:
   runtimeClassName: kata-fc
   tolerations:
