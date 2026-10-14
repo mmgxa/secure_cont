@@ -1,0 +1,44 @@
+nameOverride: kata-runtime
+
+nodeSelector:
+  katacontainers.io/kata-runtime: "true"
+
+tolerations:
+  - key: kata-runtime
+    value: "true"
+    effect: NoSchedule
+
+# Enable qemu and firecracker shims
+shims:
+  disableAll: true
+  qemu:
+    enabled: true
+    supportedArches:
+      - amd64
+      - arm64
+    allowedHypervisorAnnotations: []
+    containerd:
+      snapshotter: ""
+  fc:
+    enabled: true
+    supportedArches:
+      - amd64
+      - arm64
+    allowedHypervisorAnnotations: []
+    containerd:
+      snapshotter: "devmapper"
+
+# The chart defaults the per-arch default shim to "qemu-runtime-rs", which we do
+# NOT enable above. kata-deploy aborts at startup if DEFAULT_SHIM is not one of
+# the enabled shims. Point it at "qemu", which we do enable.
+defaultShim:
+  amd64: qemu
+  arm64: qemu
+
+runtimeClasses:
+  enabled: true
+  createDefault: false
+
+# NFD not needed since we control node selection via Karpenter
+node-feature-discovery:
+  enabled: false

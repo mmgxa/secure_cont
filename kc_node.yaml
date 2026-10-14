@@ -1,0 +1,164 @@
+# EC2NodeClass for Karpenter (nested-virtualization nodes).
+#
+# Apply AFTER `terraform apply` has installed the Karpenter controller + CRDs:
+#   kubectl apply -f nodeclass.yaml
+#   kubectl apply -f nodepool.yaml
+#
+# `role` is the node IAM role NAME (not an ARN). Karpenter resolves it to the
+# instance profile itself. This matches var.node_role_name in variables.tf.
+# If you change var.node_role_name / var.eks_cluster_name in Terraform, update
+# the values here to match.
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: nested-virt
+spec:
+  amiFamily: AL2023
+  amiSelectorTerms:
+    - alias: al2023@latest
+
+  role: k8s-selfmanaged-noderole
+
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: k8s-selfmanaged-cluster
+
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: k8s-selfmanaged-cluster
+  tags:
+    karpenter.sh/discovery: k8s-selfmanaged-cluster
+
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 60Gi
+        volumeType: gp3
+        encrypted: true
+        deleteOnTermination: true
+
+  # Enable EC2 nested virtualization
+  cpuOptions:
+    nestedVirtualization: enabled
+
+  userData: |
+    #!/bin/bash
+    set -ex
+
+    DATA_DIR=/var/lib/containerd/io.containerd.snapshotter.v1.devmapper
+    POOL_NAME=devpool
+    CONTAINERD_CONF=/etc/containerd/config.toml
+
+    # --- Step 1: Create devmapper thin-pool ---
+    mkdir -p ${DATA_DIR}
+
+    if [ ! -s "${DATA_DIR}/data" ]; then
+      truncate -s 40G "${DATA_DIR}/data"
+    fi
+    if [ ! -s "${DATA_DIR}/meta" ]; then
+      truncate -s 400M "${DATA_DIR}/meta"
+    fi
+
+    DATA_DEV=$(losetup --find --show "${DATA_DIR}/data")
+    META_DEV=$(losetup --find --show "${DATA_DIR}/meta")
+
+    SECTOR_SIZE=512
+    DATA_SIZE=$(blockdev --getsize64 -q ${DATA_DEV})
+    LENGTH_IN_SECTORS=$((DATA_SIZE / SECTOR_SIZE))
+
+    if ! dmsetup ls | grep -q "$POOL_NAME"; then
+      dmsetup create "${POOL_NAME}" \
+        --table "0 ${LENGTH_IN_SECTORS} thin-pool ${META_DEV} ${DATA_DEV} 128 32768"
+    fi
+
+    # --- Step 2: Disable discard_unpacked_layers (required for multi-snapshotter) ---
+    if [ -f "$CONTAINERD_CONF" ]; then
+      sed -i 's/discard_unpacked_layers = true/discard_unpacked_layers = false/' "$CONTAINERD_CONF"
+    fi
+
+    # --- Step 3: Add devmapper snapshotter config to containerd ---
+    if ! grep -q "devmapper" "$CONTAINERD_CONF" 2>/dev/null; then
+      cat >> "$CONTAINERD_CONF" <<'CONF'
+
+    [plugins."io.containerd.snapshotter.v1.devmapper"]
+    pool_name = "devpool"
+    root_path = "/var/lib/containerd/io.containerd.snapshotter.v1.devmapper"
+    base_image_size = "40GB"
+    CONF
+    fi
+
+    # --- Step 4: Create reload script and systemd service for reboot persistence ---
+    cat > "${DATA_DIR}/reload.sh" <<'RELOAD'
+    #!/bin/bash
+    set -e
+    DATA_DIR=/var/lib/containerd/io.containerd.snapshotter.v1.devmapper
+    POOL_NAME=devpool
+    if dmsetup ls | grep -q "$POOL_NAME"; then exit 0; fi
+    DATA_DEV=$(losetup --find --show "${DATA_DIR}/data")
+    META_DEV=$(losetup --find --show "${DATA_DIR}/meta")
+    DATA_SIZE=$(blockdev --getsize64 -q ${DATA_DEV})
+    LENGTH_IN_SECTORS=$((DATA_SIZE / 512))
+    dmsetup create "${POOL_NAME}" --table "0 ${LENGTH_IN_SECTORS} thin-pool ${META_DEV} ${DATA_DEV} 128 32768"
+    RELOAD
+    chmod +x "${DATA_DIR}/reload.sh"
+
+    cat > /etc/systemd/system/devmapper-reload.service <<'SVC'
+    [Unit]
+    Description=Reload devmapper thin-pool for containerd
+    Before=containerd.service
+
+    [Service]
+    Type=oneshot
+    ExecStart=/var/lib/containerd/io.containerd.snapshotter.v1.devmapper/reload.sh
+
+    [Install]
+    WantedBy=multi-user.target
+    SVC
+    systemctl daemon-reload
+    systemctl enable devmapper-reload.service
+
+    echo "devmapper setup complete"
+
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: nested-virt
+spec:
+  template:
+    metadata:
+      labels:
+        workload-type: nested-virt
+        katacontainers.io/kata-runtime: "true"
+        kata-deploy.katacontainers.io/default: "true"
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: nested-virt
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values:
+            - m7i
+            - m8i
+            - c7i
+            - c8i
+            # - r7i
+            # - r8i
+        - key: kubernetes.io/arch
+          operator: In
+          values:
+            - amd64
+      taints:
+      - key: kata-runtime
+        value: "true"
+        effect: NoSchedule
+  limits:
+    cpu: "100"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 1m
